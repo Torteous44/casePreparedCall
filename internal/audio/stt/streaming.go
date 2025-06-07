@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -37,32 +38,33 @@ type StreamingConfig struct {
 
 // StreamingResult represents a transcription result from the streaming API
 type StreamingResult struct {
-	Type       string  `json:"type"`
-	Text       string  `json:"text,omitempty"`
-	Confidence float64 `json:"confidence,omitempty"`
-	IsFinal    bool    `json:"is_final,omitempty"`
-	TurnID     string  `json:"turn_id,omitempty"`
-	StartTime  int64   `json:"start_time,omitempty"`
-	EndTime    int64   `json:"end_time,omitempty"`
+	MessageType string  `json:"message_type"`
+	Text        string  `json:"text,omitempty"`
+	Confidence  float64 `json:"confidence,omitempty"`
+	IsFinal     bool    `json:"is_final,omitempty"`
+	TurnID      string  `json:"turn_id,omitempty"`
+	StartTime   int64   `json:"start_time,omitempty"`
+	EndTime     int64   `json:"end_time,omitempty"`
+	SessionID   string  `json:"session_id,omitempty"`
 }
 
 // SessionBegins represents the session start message
 type SessionBegins struct {
-	Type      string    `json:"type"`
-	ID        string    `json:"id"`
-	ExpiresAt time.Time `json:"expires_at"`
+	MessageType string `json:"message_type"`
+	SessionID   string `json:"session_id"`
+	ExpiresAt   string `json:"expires_at"`
 }
 
 // AudioMessage represents an audio data message
 type AudioMessage struct {
-	Type string `json:"type"`
-	Data string `json:"data"` // base64 encoded audio data
+	MessageType string `json:"message_type"`
+	AudioData   string `json:"audio_data"` // base64 encoded audio data
 }
 
 // ConfigUpdateMessage represents a configuration update message
 type ConfigUpdateMessage struct {
-	Type   string          `json:"type"`
-	Config StreamingConfig `json:"config"`
+	MessageType string          `json:"message_type"`
+	Config      StreamingConfig `json:"config"`
 }
 
 // NewStreamingSTT creates a new streaming STT instance
@@ -90,40 +92,49 @@ func (s *StreamingSTT) Connect(ctx context.Context) error {
 	}
 
 	// Build WebSocket URL with query parameters
-	u, err := url.Parse("wss://streaming.assemblyai.com/v3/ws")
+	u, err := url.Parse("wss://api.assemblyai.com/v2/realtime/ws")
 	if err != nil {
 		return fmt.Errorf("failed to parse WebSocket URL: %w", err)
 	}
 
 	q := u.Query()
 	q.Set("sample_rate", fmt.Sprintf("%d", s.config.SampleRate))
-	if s.config.Encoding != "" {
-		q.Set("encoding", s.config.Encoding)
-	}
-	if s.config.FormatTurns {
-		q.Set("format_turns", "true")
-	}
 	u.RawQuery = q.Encode()
 
 	// Set up headers
 	headers := http.Header{}
 	headers.Set("Authorization", s.apiKey)
 
-	// Connect to WebSocket
-	conn, _, err := websocket.Dial(ctx, u.String(), &websocket.DialOptions{
-		HTTPHeader: headers,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to connect to WebSocket: %w", err)
+	log.Printf("Connecting to AssemblyAI at %s", u.String())
+
+	// Connect to WebSocket with retry logic
+	var retryCount int
+	maxRetries := 3
+	retryDelay := time.Second
+
+	for retryCount < maxRetries {
+		conn, _, err := websocket.Dial(ctx, u.String(), &websocket.DialOptions{
+			HTTPHeader: headers,
+		})
+
+		if err == nil {
+			s.conn = conn
+			s.isConnected = true
+
+			// Start message handler
+			go s.handleMessages(ctx)
+			return nil
+		}
+
+		log.Printf("Connection attempt %d failed: %v", retryCount+1, err)
+		retryCount++
+		if retryCount < maxRetries {
+			time.Sleep(retryDelay)
+			retryDelay *= 2 // Exponential backoff
+		}
 	}
 
-	s.conn = conn
-	s.isConnected = true
-
-	// Start message handler
-	go s.handleMessages(ctx)
-
-	return nil
+	return fmt.Errorf("failed to connect after %d retries: %w", maxRetries, err)
 }
 
 // SendAudio sends audio data to the streaming API
@@ -135,11 +146,28 @@ func (s *StreamingSTT) SendAudio(audioData []byte) error {
 		return fmt.Errorf("not connected")
 	}
 
-	// Encode audio data to base64
-	encodedData := base64.StdEncoding.EncodeToString(audioData)
+	// Create a context with timeout for the write operation
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Create audio message
+	msg := map[string]interface{}{
+		"message_type": "AudioData",
+		"audio_data":   base64.StdEncoding.EncodeToString(audioData),
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal audio message: %w", err)
+	}
 
 	// Send audio message
-	return s.conn.Write(context.Background(), websocket.MessageText, []byte(encodedData))
+	if err := s.conn.Write(ctx, websocket.MessageText, data); err != nil {
+		s.sendError(fmt.Errorf("failed to send audio: %w", err))
+		return err
+	}
+
+	return nil
 }
 
 // UpdateConfig sends a configuration update during the session
@@ -152,8 +180,8 @@ func (s *StreamingSTT) UpdateConfig(config StreamingConfig) error {
 	}
 
 	msg := ConfigUpdateMessage{
-		Type:   "UpdateConfiguration",
-		Config: config,
+		MessageType: "UpdateConfiguration",
+		Config:      config,
 	}
 
 	data, err := json.Marshal(msg)
@@ -198,9 +226,12 @@ func (s *StreamingSTT) GetErrors() <-chan error {
 // Close gracefully terminates the streaming session
 func (s *StreamingSTT) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	conn := s.conn
+	s.isConnected = false
+	s.conn = nil
+	s.mu.Unlock()
 
-	if !s.isConnected || s.conn == nil {
+	if conn == nil {
 		return nil
 	}
 
@@ -211,15 +242,15 @@ func (s *StreamingSTT) Close() error {
 
 	data, err := json.Marshal(msg)
 	if err == nil {
-		s.conn.Write(context.Background(), websocket.MessageText, data)
+		if err := conn.Write(context.Background(), websocket.MessageText, data); err != nil {
+			log.Printf("Failed to send SessionTermination: %v", err)
+		}
 	}
 
 	// Close WebSocket connection
-	err = s.conn.Close(websocket.StatusNormalClosure, "")
-	s.isConnected = false
-	s.conn = nil
+	err = conn.Close(websocket.StatusNormalClosure, "")
 
-	// Close channels
+	// Close channels after connection is closed
 	close(s.transcripts)
 	close(s.errors)
 
@@ -234,31 +265,67 @@ func (s *StreamingSTT) handleMessages(ctx context.Context) {
 		}
 	}()
 
+	// Create a heartbeat ticker
+	heartbeat := time.NewTicker(30 * time.Second)
+	defer heartbeat.Stop()
+
+	var currentSessionID string
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-heartbeat.C:
+			// Send heartbeat message
+			msg := map[string]string{"type": "KeepAlive"}
+			data, err := json.Marshal(msg)
+			if err == nil {
+				err = s.conn.Write(ctx, websocket.MessageText, data)
+				if err != nil {
+					s.errors <- fmt.Errorf("heartbeat failed: %w", err)
+					s.reconnect(ctx)
+					return
+				}
+			}
 		default:
-			if s.conn == nil {
+			s.mu.RLock()
+			conn := s.conn
+			if conn == nil {
+				s.mu.RUnlock()
+				s.errors <- fmt.Errorf("connection lost")
+				s.reconnect(ctx)
 				return
 			}
 
-			_, message, err := s.conn.Read(ctx)
+			_, message, err := conn.Read(ctx)
+			s.mu.RUnlock()
+
 			if err != nil {
-				s.errors <- fmt.Errorf("failed to read message: %w", err)
+				if websocket.CloseStatus(err) == websocket.StatusNormalClosure {
+					return
+				}
+				select {
+				case s.errors <- fmt.Errorf("failed to read message: %w", err):
+				default:
+					log.Printf("[WARN] Dropping error: failed to read message: %v", err)
+				}
+				s.reconnect(ctx)
 				return
 			}
 
 			// Parse message
 			var baseMsg map[string]interface{}
 			if err := json.Unmarshal(message, &baseMsg); err != nil {
-				s.errors <- fmt.Errorf("failed to parse message: %w", err)
+				s.sendError(fmt.Errorf("failed to parse message: %w", err))
 				continue
 			}
 
-			msgType, ok := baseMsg["type"].(string)
+			// Log raw message for debugging
+			log.Printf("[DEBUG] Raw message: %s", string(message))
+
+			msgType, ok := baseMsg["message_type"].(string)
 			if !ok {
-				s.errors <- fmt.Errorf("invalid message type")
+				s.sendError(fmt.Errorf("invalid message type"))
 				continue
 			}
 
@@ -266,58 +333,109 @@ func (s *StreamingSTT) handleMessages(ctx context.Context) {
 			case "SessionBegins":
 				var sessionBegins SessionBegins
 				if err := json.Unmarshal(message, &sessionBegins); err != nil {
-					s.errors <- fmt.Errorf("failed to parse SessionBegins: %w", err)
+					s.sendError(fmt.Errorf("failed to parse SessionBegins: %w", err))
 					continue
 				}
-				// Session started successfully
+				currentSessionID = sessionBegins.SessionID
+				log.Printf("[INFO] Session established, ID: %s", sessionBegins.SessionID)
 
-			case "Turn":
-				var result StreamingResult
-				if err := json.Unmarshal(message, &result); err != nil {
-					s.errors <- fmt.Errorf("failed to parse Turn: %w", err)
-					continue
-				}
-				result.Type = "Turn"
-				s.transcripts <- result
+			case "Connected":
+				log.Printf("[INFO] Successfully connected to AssemblyAI streaming service")
 
 			case "PartialTranscript":
 				var result StreamingResult
 				if err := json.Unmarshal(message, &result); err != nil {
-					s.errors <- fmt.Errorf("failed to parse PartialTranscript: %w", err)
+					s.sendError(fmt.Errorf("failed to parse PartialTranscript: %w", err))
 					continue
 				}
-				result.Type = "PartialTranscript"
+				result.MessageType = "PartialTranscript"
 				result.IsFinal = false
-				s.transcripts <- result
+				result.SessionID = currentSessionID
+				if result.Text != "" {
+					log.Printf("[DEBUG] Partial: %s", result.Text)
+					s.transcripts <- result
+				}
 
 			case "FinalTranscript":
 				var result StreamingResult
 				if err := json.Unmarshal(message, &result); err != nil {
-					s.errors <- fmt.Errorf("failed to parse FinalTranscript: %w", err)
+					s.sendError(fmt.Errorf("failed to parse FinalTranscript: %w", err))
 					continue
 				}
-				result.Type = "FinalTranscript"
+				result.MessageType = "FinalTranscript"
 				result.IsFinal = true
-				s.transcripts <- result
+				result.SessionID = currentSessionID
+				if result.Text != "" {
+					log.Printf("[INFO] Final: %s", result.Text)
+					s.transcripts <- result
+				}
 
-			case "Termination":
+			case "Error":
+				var errorMsg struct {
+					Type    string `json:"message_type"`
+					Message string `json:"message"`
+					Code    string `json:"error"`
+				}
+				if err := json.Unmarshal(message, &errorMsg); err != nil {
+					s.sendError(fmt.Errorf("failed to parse error message: %w", err))
+					continue
+				}
+				log.Printf("[ERROR] AssemblyAI error: %s (code: %s)", errorMsg.Message, errorMsg.Code)
+				s.sendError(fmt.Errorf("server error: %s (code: %s)", errorMsg.Message, errorMsg.Code))
+
+			case "SessionTerminated":
+				log.Printf("[INFO] Session terminated by server")
+				currentSessionID = ""
 				return
 
 			default:
-				s.errors <- fmt.Errorf("unknown message type: %s", msgType)
+				if msgType != "" {
+					log.Printf("[DEBUG] Received message type: %s", msgType)
+					log.Printf("[DEBUG] Raw message: %s", string(message))
+				}
 			}
 		}
+	}
+}
+
+// reconnect attempts to reestablish the WebSocket connection
+func (s *StreamingSTT) reconnect(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn != nil {
+		s.conn.Close(websocket.StatusGoingAway, "reconnecting")
+		s.conn = nil
+	}
+	s.isConnected = false
+
+	// Try to reconnect
+	err := s.Connect(ctx)
+	if err != nil {
+		s.errors <- fmt.Errorf("reconnection failed: %w", err)
 	}
 }
 
 // GetDefaultStreamingConfig returns default configuration for streaming
 func GetDefaultStreamingConfig() StreamingConfig {
 	return StreamingConfig{
-		SampleRate:                       16000,
-		Encoding:                         "pcm_s16le",
-		FormatTurns:                      true,
-		EndOfTurnConfidenceThreshold:     0.7,
-		MinEndOfTurnSilenceWhenConfident: 1000,
-		MaxTurnSilence:                   3000,
+		SampleRate: 16000,
+		Encoding:   "pcm_s16le",
 	}
+}
+
+// Helper function for sending errors
+func (s *StreamingSTT) sendError(err error) {
+	select {
+	case s.errors <- err:
+	default:
+		log.Printf("Dropping error: %v", err)
+	}
+}
+
+// GetConfig returns the current streaming configuration
+func (s *StreamingSTT) GetConfig() StreamingConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.config
 }

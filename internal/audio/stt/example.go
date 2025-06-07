@@ -72,7 +72,7 @@ func StreamingExample() {
 
 // handleTranscript processes received transcription results
 func handleTranscript(result StreamingResult) {
-	switch result.Type {
+	switch result.MessageType {
 	case "PartialTranscript":
 		fmt.Printf("Partial: %s (confidence: %.2f)\n", result.Text, result.Confidence)
 	case "FinalTranscript":
@@ -80,7 +80,7 @@ func handleTranscript(result StreamingResult) {
 	case "Turn":
 		fmt.Printf("Turn [%s]: %s (%.2f)\n", result.TurnID, result.Text, result.Confidence)
 	default:
-		fmt.Printf("Unknown type %s: %s\n", result.Type, result.Text)
+		fmt.Printf("Unknown type %s: %s\n", result.MessageType, result.Text)
 	}
 }
 
