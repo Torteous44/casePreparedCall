@@ -202,7 +202,7 @@ func (s *StreamingSTT) ForceEndpoint() error {
 	}
 
 	msg := map[string]string{
-		"type": "ForceEndpoint",
+		"message_type": "ForceEndpoint",
 	}
 
 	data, err := json.Marshal(msg)
@@ -237,7 +237,7 @@ func (s *StreamingSTT) Close() error {
 
 	// Send session termination message
 	msg := map[string]string{
-		"type": "SessionTermination",
+		"message_type": "SessionTermination",
 	}
 
 	data, err := json.Marshal(msg)
@@ -265,28 +265,12 @@ func (s *StreamingSTT) handleMessages(ctx context.Context) {
 		}
 	}()
 
-	// Create a heartbeat ticker
-	heartbeat := time.NewTicker(30 * time.Second)
-	defer heartbeat.Stop()
-
 	var currentSessionID string
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-heartbeat.C:
-			// Send heartbeat message
-			msg := map[string]string{"type": "KeepAlive"}
-			data, err := json.Marshal(msg)
-			if err == nil {
-				err = s.conn.Write(ctx, websocket.MessageText, data)
-				if err != nil {
-					s.errors <- fmt.Errorf("heartbeat failed: %w", err)
-					s.reconnect(ctx)
-					return
-				}
-			}
 		default:
 			s.mu.RLock()
 			conn := s.conn

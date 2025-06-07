@@ -24,6 +24,7 @@ func main() {
 
 	// Set up HTTP routes
 	http.HandleFunc("/api/interview/init", interviewManager.InitializeSession)
+	http.HandleFunc("/api/interview/init-with-lesson", interviewManager.InitializeSessionWithLesson)
 	http.HandleFunc("/api/interview/status", interviewManager.GetSessionStatus)
 	http.HandleFunc("/api/interview/close", interviewManager.CloseSession)
 
