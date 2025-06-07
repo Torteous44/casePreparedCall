@@ -1,0 +1,147 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+
+
+# 1. Project Overview
+# -------------------
+# AI-powered mock case interview service, driving a 4-stage interview loop with real-time grading,
+# multi-turn follow-ups, and audio I/O over WebSockets/WebRTC.
+
+overview:
+  name: “CasePrepared Call Microservice”
+  purpose: >
+    Provide low-latency, context-aware AI mock-interview sessions:
+    – capture user audio
+    – transcribe (STT)
+    – grade & decide next action (LLM)
+    – synthesize response (TTS)
+    – stream back to user
+  assumptions:
+    - Single Go binary, horizontally scalable
+    - Session state is ephemeral (Redis+in-mem), flushed to analytics at end
+    - Transport via secure WebSocket data-channel (audio + JSON)
+
+# 2. High-Level Architecture
+# ---------------------------
+architecture:
+  components:
+    - orchestrator:
+        responsibilities:
+          - WebSocket server for audio/JSON frames
+          - Demux audio vs. control messages
+          - Drive ASK → LISTEN → ANALYZE → RESPOND loop
+    - audio_pipeline:
+        modules:
+          - vad: filter silence
+          - stt: streaming Whisper client
+          - tts: streaming OpenAI/ElevenLabs client
+    - context_brain:
+        responsibilities:
+          - Build LLM prompts (initial, grading, follow-up, wrap-up)
+          - Invoke ChatCompletion with cancelable contexts
+          - Parse GradeResponse JSON
+    - session_state:
+        persistence:
+          - Redis hash & list (TTL’d) for in-flight sessions
+          - In-memory cache for hot reads
+        stores:
+          - conversation history (timestamped turns)
+          - interview objectives & question list
+          - current question index + coverage flags
+          - user metadata & profile
+          - ephemeral tokens (LLM/TTS in progress)
+    - transport:
+        protocols:
+          - WebSocket (binary audio frames + JSON control)
+          - HTTP REST for session init/end & analytics flush
+
+# 3. Core Data Models
+# --------------------
+models:
+  Stage:
+    id: string
+    prompt: string
+    exampleAnswer: string
+    rubricCriteria: [string]
+    thresholds: map[string]float64
+  GradeResponse:
+    scores: map[string]float64
+    overallScore: float64
+    decision: enum(elaborate,clarify,reprompt,moveOn,wrapUp)
+    feedback: [string]
+  SessionState:
+    sessionId: string
+    caseId: string
+    questionId: string
+    questionPrompt: string
+    caseBackground: string
+    caseScope: string
+    currentIndex: int
+    coverageFlags: map[string]bool
+    userProfile: map[string]string
+    turns: [ { speaker, text, timestamp } ]
+    followUpCount: int
+    inProgress: bool
+
+# 4. Directory Layout
+# --------------------
+layout:
+  cmd/callservice:
+    - main.go       # application bootstrap
+    - config.go     # env/flags
+  internal/audio/vad:
+    - vad.go        # silence filter
+  internal/audio/stt:
+    - stt.go        # Whisper streaming client
+  internal/audio/tts:
+    - tts.go        # TTS streaming client
+  internal/orchestrator:
+    - orchestrator.go  # main loop & WS I/O
+    - audio_ingest.go  # frame demux & routing
+  internal/contextbrain:
+    - client.go     # ChatCompletion wrapper
+    - prompts.go    # prompt templates
+    - grading.go    # GradeResponse parsing
+  internal/sessionstate:
+    - state.go      # SessionState struct
+    - store.go      # Redis operations, TTL
+  pkg/transport:
+    - ws.go         # WebSocket handler
+    - types.go      # audio/control frame definitions
+  configs/:
+    - default.yaml  # sample config
+  docs/:
+    - architecture.md
+  scripts/:
+    - deploy.sh
+
+# 5. Data Flow
+# ------------
+data_flow:
+  - FrontEnd → WebSocket: audio frames (20ms chunks)
+  - Orchestrator → VAD → STT: partial & final transcripts
+  - Final transcript → ContextBrain:
+      • build grading prompt
+      • call LLM → GradeResponse
+  - Orchestrator maps decision → follow-up or wrap-up prompt
+  - Prompt text → TTS → audio chunks
+  - Orchestrator → WebSocket → FrontEnd playback
+  - On session end → flatten SessionState → analytics DB → DEL Redis keys
+
+# 6. Scalability & Resilience
+# ----------------------------
+scaling:
+  - Stateless services behind LB
+  - Redis for shared session recovery
+  - Kubernetes horizontal pod autoscaling on CPU & session count
+  - TLS/WSS everywhere
+
+# 7. Analytics Flush
+# -------------------
+analytics:
+  - Trigger: sessionstate.inProgress → false
+  - Action: serialize SessionState → JSON → INSERT analytics table
+  - Cleanup: delete Redis keys, free in-mem state

@@ -1,0 +1,15 @@
+# Default configuration for Call Service
+# TODO: Add configuration parameters here
+
+server:
+  port: 8080
+  host: "localhost"
+
+audio:
+  # TODO: Add audio configuration
+
+database:
+  # TODO: Add database configuration
+
+logging:
+  level: "info" 
