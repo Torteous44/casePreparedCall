@@ -112,3 +112,13 @@ func (s *STT) TranscribeWithOptions(audioData []byte, opts *assemblyai.Transcrip
 
 	return *transcript.Text, nil
 }
+
+// NewStreamingSTTWithDefaults creates a new streaming STT instance with default configuration
+func (s *STT) NewStreamingSTTWithDefaults() *StreamingSTT {
+	return NewStreamingSTT(GetDefaultStreamingConfig())
+}
+
+// NewStreamingSTTWithConfig creates a new streaming STT instance with custom configuration
+func (s *STT) NewStreamingSTTWithConfig(config StreamingConfig) *StreamingSTT {
+	return NewStreamingSTT(config)
+}
